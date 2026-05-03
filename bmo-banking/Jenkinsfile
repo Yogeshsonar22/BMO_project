@@ -1,0 +1,119 @@
+pipeline {
+    agent any
+
+    environment {
+        JAVA_HOME    = '/usr/lib/jvm/java-8-openjdk-amd64'
+        MAVEN_HOME   = '/usr/share/maven'
+        AWS_REGION   = 'us-east-1'
+        ECR_REGISTRY = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        APP_NAME     = 'bmo-banking'
+    }
+
+    tools {
+        maven 'Maven-3.9'
+        jdk   'JDK-8'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+            }
+        }
+
+        stage('Build & Test') {
+            steps {
+                echo 'Building all microservices...'
+                sh 'mvn clean package -DskipTests=false --batch-mode'
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Code Quality - SonarQube') {
+            when { branch 'main' }
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh 'mvn sonar:sonar'
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            when { branch 'main' }
+            steps {
+                script {
+                    def services = [
+                        'eureka-server',
+                        'config-server',
+                        'api-gateway',
+                        'account-service',
+                        'transaction-service',
+                        'payment-service',
+                        'notification-service'
+                    ]
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                    services.each { service ->
+                        def imageTag = "${ECR_REGISTRY}/${APP_NAME}/${service}:${BUILD_NUMBER}"
+                        sh "docker build -t ${imageTag} ./${service}"
+                        sh "docker push ${imageTag}"
+                        sh "docker tag ${imageTag} ${ECR_REGISTRY}/${APP_NAME}/${service}:latest"
+                        sh "docker push ${ECR_REGISTRY}/${APP_NAME}/${service}:latest"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+            when { branch 'main' }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'ec2-ssh-key',
+                                                   keyFileVariable: 'SSH_KEY',
+                                                   usernameVariable: 'SSH_USER')]) {
+                    script {
+                        def ec2Host = "${env.EC2_HOST}"
+                        sh """
+                            ssh -o StrictHostKeyChecking=no -i \$SSH_KEY \$SSH_USER@${ec2Host} '
+                                cd /opt/bmo-banking &&
+                                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY} &&
+                                docker-compose pull &&
+                                docker-compose up -d --remove-orphans
+                            '
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Health Check') {
+            when { branch 'main' }
+            steps {
+                script {
+                    sleep(time: 30, unit: 'SECONDS')
+                    def ec2Host = "${env.EC2_HOST}"
+                    sh "curl -f http://${ec2Host}:8761/actuator/health || exit 1"
+                    sh "curl -f http://${ec2Host}:8080/actuator/health || exit 1"
+                    echo 'All services healthy!'
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Pipeline SUCCESS — Build #${BUILD_NUMBER}"
+        }
+        failure {
+            echo "❌ Pipeline FAILED — Build #${BUILD_NUMBER}"
+            // Add email/Slack notification here
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
